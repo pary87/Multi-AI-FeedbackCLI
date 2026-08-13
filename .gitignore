@@ -1,0 +1,6 @@
+# Python bytecode cache -- regenerated automatically, never hand-edited
+__pycache__/
+*.pyc
+
+# Scratch file created and deleted by `council check`; only survives a crash
+.council_selftest.txt
