@@ -46,6 +46,7 @@ auto_push = true       # after every round, upload threads to GitHub (only if th
 [agents.claude]
 label = "Claude"
 enabled = true
+client_data = true     # may take part in questions marked "contains client data"
 # -p: non-interactive. --tools: only read/search tools exist, so it cannot write.
 # --strict-mcp-config: your MCP servers stay out of council rounds.
 command = [
@@ -63,6 +64,7 @@ install_hint = "Install Claude Code and log in with your Claude plan: https://do
 [agents.chatgpt]
 label = "ChatGPT"
 enabled = true
+client_data = true
 # exec: non-interactive. read-only sandbox. -o: write only the final message.
 command = [
   "codex", "exec",
@@ -80,6 +82,7 @@ install_hint = "npm install -g @openai/codex   then: codex login   (choose Sign 
 [agents.kimi]
 label = "Kimi"
 enabled = true
+client_data = false    # China-based provider: off for client data unless you decide otherwise
 # -p: non-interactive. Kimi has no read-only switch in -p mode, so --agent-file
 # gives it a profile whose only tools are Read, Glob and Grep.
 command = [
@@ -99,6 +102,7 @@ PRESETS: dict[str, str] = {
 [agents.glm]
 label = "GLM"
 enabled = true
+client_data = false    # China-based provider: off for client data unless you decide otherwise
 # GLM-5.3 on the Z.ai GLM Coding Plan, run through Claude Code pointed at Z.ai
 # (the setup Z.ai documents). It gets its own Claude Code profile folder, so your
 # normal Claude seat and your Anthropic login are never touched or sent to Z.ai.
@@ -129,6 +133,10 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL = "glm-5.3-flash"
 API_TIMEOUT_MS = "3000000"
 ''',
 }
+
+# Seats whose providers are China-based stay out of client-data threads unless
+# council.toml explicitly says `client_data = true` for them.
+CLIENT_DATA_OFF_BY_DEFAULT = {"kimi", "glm"}
 
 ALLOWED_PLACEHOLDERS = {"instruction", "output_file", "view_dir", "council_dir"}
 ENV_PLACEHOLDERS = {"home", "council_dir"}
@@ -167,6 +175,8 @@ class AgentSpec:
     env: dict[str, str] = field(default_factory=dict)
     # Variables removed from this agent's process (e.g. credentials it must not see).
     unset_env: list[str] = field(default_factory=list)
+    # May this seat take part in threads marked as containing client data?
+    client_data: bool = True
 
     def env_refs(self) -> list[str]:
         """Names of the OS environment variables this agent's env table needs."""
@@ -235,6 +245,9 @@ def load_config(path: Path) -> Config:
             except re.error as exc:
                 raise CouncilError(f"{where} strip_regex {pattern!r} is invalid: {exc}") from None
         env = _parse_env(raw.get("env", {}), where)
+        client_data = raw.get("client_data", key not in CLIENT_DATA_OFF_BY_DEFAULT)
+        if not isinstance(client_data, bool):
+            raise CouncilError(f"{where} client_data must be true or false")
         unset_env = raw.get("unset_env", [])
         if not isinstance(unset_env, list) or not all(
             isinstance(n, str) and ENV_NAME_RE.match(n) for n in unset_env
@@ -257,6 +270,7 @@ def load_config(path: Path) -> Config:
             install_hint=str(raw.get("install_hint", "")),
             env=env,
             unset_env=list(unset_env),
+            client_data=client_data,
         )
     auto_push = defaults.get("auto_push", True)
     if not isinstance(auto_push, bool):
@@ -370,10 +384,37 @@ def check_batch_wrapper_args(argv: list[str], is_windows: bool | None = None) ->
             )
 
 
+def unwrap_cli_bullets(text: str) -> str:
+    """Undo terminal list formatting around a Markdown reply.
+
+    Kimi's text output prints each message as a list item: "• " before the first
+    line and two spaces before every later line, which turns headings and tables
+    into literal text. When the whole reply has exactly that shape, strip it so
+    the reply is plain Markdown again; any other text is returned unchanged.
+    """
+    lines = text.split("\n")
+    if not lines[0].startswith("\u2022 "):
+        return text
+    if not all(not l.strip() or l.startswith(("\u2022 ", "  ")) for l in lines):
+        return text
+    if not any(l.startswith("  ") and l.strip() for l in lines):
+        return text  # a plain list of bullets, not a wrapped reply
+    out: list[str] = []
+    for line in lines:
+        if line.startswith("\u2022 "):
+            if out and out[-1].strip():
+                out.append("")
+            out.append(line[2:])
+        else:
+            out.append(line[2:] if line.startswith("  ") else "")
+    return "\n".join(out)
+
+
 def clean_output(text: str, strip_regex: list[str] | None = None) -> str:
     """Normalise a reply: LF endings, no terminal colour codes, configured noise removed."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = ANSI_RE.sub("", text)
+    text = unwrap_cli_bullets(text)
     for pattern in strip_regex or []:
         text = re.sub(pattern, "", text)
     text = text.strip()

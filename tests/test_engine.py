@@ -599,5 +599,205 @@ class CliAdditionsTests(EngineTestCase):
         self.assertIn(f"sync: uploads to {bare}", out)
 
 
+class ClientDataTests(EngineTestCase):
+    def test_defaults_keep_china_based_seats_out(self) -> None:
+        path = Path(self._tmp.name) / "c.toml"
+        path.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
+        add_preset(path, "glm")
+        config = load_config(path)
+        cleared = {key: spec.client_data for key, spec in config.agents.items()}
+        self.assertEqual(cleared, {"claude": True, "chatgpt": True, "kimi": False, "glm": False})
+        # An older council.toml with no client_data keys gets the same safe defaults.
+        old = Path(self._tmp.name) / "old.toml"
+        old.write_text(fake_config(), encoding="utf-8")
+        self.assertFalse(load_config(old).get("kimi").client_data)
+        self.assertTrue(load_config(old).get("claude").client_data)
+
+    def test_engine_refuses_uncleared_seat_on_client_thread(self) -> None:
+        thread = self.ws.create_thread("client", "q?", ["claude", "kimi"], client_data=True)
+        with self.assertRaises(CouncilError) as caught:
+            run_round(thread, self.config)
+        self.assertIn("Kimi is not cleared for client data", str(caught.exception))
+        self.assertEqual(thread.rounds, [])
+        ok = self.ws.create_thread("client2", "q?", ["claude", "chatgpt"], client_data=True)
+        self.assertTrue(run_round(ok, self.config).complete)
+        with self.assertRaises(CouncilError):
+            run_synthesis(ok, self.config, "kimi")
+
+    def test_cli_client_data_flag(self) -> None:
+        def cli(*args, expect=0):
+            proc = subprocess.run(
+                [sys.executable, "-m", "council_engine", "--home", str(self.home), *args],
+                cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+            )
+            self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+            return proc.stdout + proc.stderr
+
+        out = cli("ask", "client q", "-q", "q?", "--client-data", "--rounds", "1")
+        self.assertIn("client data: only claude, chatgpt take part", out)
+        self.assertEqual(json.loads((self.ws.thread("1").path / "thread.json").read_text())["client_data"], True)
+        out = cli("new", "x", "-q", "q?", "--client-data", "--agents", "claude,kimi", expect=2)
+        self.assertIn("Kimi is not cleared for client data", out)
+        out = cli("ask", "y", "-q", "q?", "--client-data", "--synth", "kimi", expect=2)
+        self.assertIn("cannot write this synthesis", out)
+        self.assertIn("client data:  yes", cli("status", "1"))
+
+
+class StopTests(EngineTestCase):
+    def test_stop_kills_agents_and_saves_nothing(self) -> None:
+        import threading as _threading
+
+        thread = self.new_thread()
+        pidfile = Path(self._tmp.name) / "pids.txt"
+        os.environ["FAKE_PIDFILE"] = str(pidfile)
+        self._env_keys.append("FAKE_PIDFILE")
+        self.mode("kimi", "hang")
+        stop = _threading.Event()
+
+        def press_stop() -> None:
+            deadline = time.monotonic() + 20
+            while not pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            stop.set()
+
+        _threading.Thread(target=press_stop, daemon=True).start()
+        from council_engine.runner import RunStopped
+
+        started = time.monotonic()
+        with self.assertRaises(RunStopped):
+            run_round(thread, self.config, stop=stop)
+        self.assertLess(time.monotonic() - started, 30)
+        for pid in map(int, pidfile.read_text().split()):
+            end = time.monotonic() + 5
+            while _alive(pid) and time.monotonic() < end:
+                time.sleep(0.1)
+            self.assertFalse(_alive(pid), f"pid {pid} survived Stop")
+        self.assertEqual(thread.rounds, [])
+        self.assertFalse(thread.response_path(1, "claude").exists())
+
+
+class ConfigEditTests(EngineTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.path = Path(self._tmp.name) / "council.toml"
+        self.path.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
+
+    def test_defaults_keep_comments(self) -> None:
+        from council_engine.config_edit import set_default
+
+        set_default(self.path, "timeout_minutes", 40)
+        set_default(self.path, "auto_push", False)
+        text = self.path.read_text(encoding="utf-8")
+        self.assertIn("timeout_minutes = 40   # per agent, per round", text)
+        self.assertIn("auto_push = false", text)
+        config = load_config(self.path)
+        self.assertEqual(config.timeout_s, 2400)
+        self.assertFalse(config.auto_push)
+
+    def test_client_data_toggle(self) -> None:
+        from council_engine.config_edit import set_agent_value
+
+        set_agent_value(self.path, "kimi", "client_data", True)
+        self.assertTrue(load_config(self.path).get("kimi").client_data)
+        self.assertIn("client_data = true    # China-based provider", self.path.read_text(encoding="utf-8"))
+        set_agent_value(self.path, "kimi", "client_data", False)
+        self.assertFalse(load_config(self.path).get("kimi").client_data)
+
+    def test_levels_round_trip(self) -> None:
+        from council_engine.config_edit import get_levels, set_levels
+
+        set_levels(self.path, "claude", {"model": "best", "effort": "max"})
+        set_levels(self.path, "chatgpt", {"reasoning": "high"})
+        config = load_config(self.path)
+        claude, codex = config.get("claude"), config.get("chatgpt")
+        self.assertEqual(get_levels(claude), {"model": "best", "effort": "max"})
+        self.assertEqual(get_levels(codex), {"reasoning": "high"})
+        self.assertEqual(codex.command[:4], ["codex", "exec", "-c", "model_reasoning_effort=high"])
+        self.assertEqual(codex.command[-1], "{instruction}")
+        self.assertIn("--tools", claude.command)  # read-only flags untouched
+        text = self.path.read_text(encoding="utf-8")
+        self.assertIn("# -p: non-interactive. --tools", text)  # comments kept
+        set_levels(self.path, "claude", {"model": "default", "effort": "default"})
+        set_levels(self.path, "chatgpt", {"reasoning": "default"})
+        config = load_config(self.path)
+        self.assertNotIn("--model", config.get("claude").command)
+        self.assertNotIn("-c", config.get("chatgpt").command)
+        self.assertEqual(config.get("claude").command, load_config(self._default_copy()).get("claude").command)
+
+    def _default_copy(self) -> Path:
+        p = Path(self._tmp.name) / "fresh.toml"
+        p.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
+        return p
+
+    def test_bad_level_leaves_file_untouched(self) -> None:
+        from council_engine.config_edit import set_levels
+
+        before = self.path.read_text(encoding="utf-8")
+        with self.assertRaises(CouncilError):
+            set_levels(self.path, "claude", {"effort": "turbo"})
+        with self.assertRaises(CouncilError):
+            set_levels(self.path, "kimi", {"model": "x"})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_glm_model_switch(self) -> None:
+        from council_engine.config_edit import get_levels, seat_kind, set_levels
+
+        add_preset(self.path, "glm")
+        set_levels(self.path, "glm", {"model": "glm-5.3-flash"})
+        spec = load_config(self.path).get("glm")
+        self.assertEqual(seat_kind(spec), "glm")
+        self.assertEqual(get_levels(spec), {"model": "glm-5.3-flash"})
+        self.assertEqual(spec.env["ANTHROPIC_AUTH_TOKEN"], "${ZAI_API_KEY}")  # env table intact
+
+
+class AppSupportTests(EngineTestCase):
+    """Engine pieces the app relies on."""
+
+    def test_kimi_bullet_wrapping_is_removed(self) -> None:
+        from council_engine.agents import unwrap_cli_bullets
+
+        wrapped = "\u2022 # Title\n\n  ## Part\n  text\n  | a | b |\n"
+        self.assertEqual(clean_output(wrapped), "# Title\n\n## Part\ntext\n| a | b |\n")
+        # Ordinary Markdown and a plain list of bullets are left alone.
+        for text in ("# Title\n\n  indented code?\n", "\u2022 one\n\u2022 two\n", "plain\n"):
+            self.assertEqual(unwrap_cli_bullets(text), text)
+
+    def test_plan_is_recorded_with_the_thread(self) -> None:
+        thread = self.ws.create_thread("t", "q?", ["claude"], plan={"rounds": 3, "synthesis_by": None})
+        on_disk = json.loads((thread.path / "thread.json").read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["plan"], {"rounds": 3, "synthesis_by": None})
+        self.assertEqual(self.ws.git("status", "--porcelain", "--", "threads").stdout.strip(), "")  # committed
+
+    def test_unpushed_count_and_log(self) -> None:
+        self.assertIsNone(self.ws.unpushed_commits())  # no remote
+        bare = Path(self._tmp.name) / "remote.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        self.ws.git("remote", "add", "origin", str(bare))
+        thread = self.new_thread()
+        self.assertIsNone(self.ws.unpushed_commits())  # branch never pushed
+        self.assertEqual(self.ws.push(), "pushed")
+        self.assertEqual(self.ws.unpushed_commits(), 0)
+        run_round(thread, self.config)
+        self.assertEqual(self.ws.unpushed_commits(), 1)
+        subjects = [c["subject"] for c in self.ws.log(thread.path)]
+        self.assertEqual(subjects, ["T-0001 round 1: claude ok, chatgpt ok, kimi ok",
+                                    'T-0001: new thread "LDO selection"'])
+
+    def test_question_survives_windows_line_endings(self) -> None:
+        thread = self.ws.create_thread("t", "line one\nline two", ["claude"])
+        thread.question_path.write_bytes(b"line one\r\nline two\r\n")  # as git checks out on Windows
+        self.assertEqual(thread.question(), "line one\nline two\n")
+        thread.question_path.write_text("edited\n", encoding="utf-8")
+        with self.assertRaises(CouncilError):
+            thread.question()
+
+    def test_command_lines_stay_readable(self) -> None:
+        from council_engine.config_edit import _format_command
+
+        text = _format_command(["codex", "exec", "-o", "{output_file}", "{instruction}"])
+        self.assertEqual(text.splitlines(), ["command = [", '  "codex", "exec",',
+                                             '  "-o", "{output_file}",', '  "{instruction}",', "]"])
+
+
 if __name__ == "__main__":
     unittest.main()

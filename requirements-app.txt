@@ -1,0 +1,2 @@
+# Only the app needs this; the terminal commands use the Python standard library alone.
+nicegui>=3.18,<4

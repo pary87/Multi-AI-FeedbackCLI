@@ -129,7 +129,7 @@ class Workspace:
         if not ws.config_path.exists():
             raise CouncilError(
                 f"no council workspace at {root} (missing {CONFIG_FILE}). "
-                f"Create one with: python -m council_engine init --home \"{root}\""
+                f"Create one with: python -m council_engine --home \"{root}\" init"
             )
         ws.ensure_support_files()
         return ws
@@ -237,6 +237,34 @@ class Workspace:
         lines = [line.strip() for line in (proc.stderr or proc.stdout).splitlines() if line.strip()]
         return "failed: " + (lines[-1][:200] if lines else f"exit code {proc.returncode}")
 
+    def unpushed_commits(self) -> int | None:
+        """How many commits on this branch are not on origin yet. None when that
+        is unknown: no remote, a detached HEAD, or a branch never pushed."""
+        if self.remote_url() is None:
+            return None
+        branch = self.git("rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip()
+        if not branch or branch == "HEAD":
+            return None
+        proc = self.git("rev-list", "--count", f"origin/{branch}..HEAD", check=False)
+        if proc.returncode != 0:
+            return None
+        return int(proc.stdout.strip() or 0)
+
+    def log(self, path: Path | None = None, limit: int = 50) -> list[dict]:
+        """Recent commits (newest first), optionally only those touching `path`."""
+        if not self.is_git_repo():
+            return []
+        args = ["log", f"-{limit}", "--format=%h%x09%cI%x09%s"]
+        if path is not None:
+            args += ["--", str(path.resolve().relative_to(self.root))]
+        proc = self.git(*args, check=False)
+        out = []
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) == 3:
+                out.append({"hash": parts[0], "date": parts[1], "subject": parts[2]})
+        return out
+
     # -- threads -------------------------------------------------------------
 
     def thread_dirs(self) -> list[Path]:
@@ -269,7 +297,11 @@ class Workspace:
         question: str,
         participants: list[str],
         attachments: list[Path] | None = None,
+        client_data: bool = False,
+        plan: dict | None = None,
     ) -> "Thread":
+        """Create a thread folder and commit it. `plan` (optional) records what the
+        caller intends to run, e.g. {"rounds": 2, "synthesis_by": "claude"}."""
         if not question.strip():
             raise CouncilError("the question is empty")
         if not participants:
@@ -295,11 +327,14 @@ class Workspace:
             "title": title,
             "created": now_iso(),
             "participants": participants,
+            "client_data": bool(client_data),
             "question_sha256": sha256_file(question_path),
             "attachments": attached,
             "rounds": [],
             "syntheses": [],
         }
+        if plan:
+            manifest["plan"] = dict(plan)
         thread = Thread(self, path, manifest)
         thread.save()
         self.commit([path], f"{thread_id}: new thread \"{title}\"")
@@ -336,11 +371,19 @@ class Thread:
         return list(self.manifest["participants"])
 
     @property
+    def client_data(self) -> bool:
+        return bool(self.manifest.get("client_data", False))
+
+    @property
     def question_path(self) -> Path:
         return self.path / QUESTION_FILE
 
     def question(self) -> str:
         text = read_text(self.question_path)
+        if sha256_text(text) != self.manifest["question_sha256"] and "\r\n" in text:
+            # Git on Windows may check files out with CRLF line endings (core.autocrlf).
+            # The engine always writes LF, so compare the LF form before calling it edited.
+            text = text.replace("\r\n", "\n")
         if sha256_text(text) != self.manifest["question_sha256"]:
             raise CouncilError(
                 f"{self.id}: {QUESTION_FILE} was edited after the thread started. "

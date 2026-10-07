@@ -86,17 +86,28 @@ def _read_question(args) -> str:
     raise CouncilError('no question given: use -q "text" or -f question.md (or -f - for stdin)')
 
 
-def _participants(config: Config, agents_arg: str | None) -> list[str]:
+def _participants(config: Config, agents_arg: str | None, client_data: bool = False) -> list[str]:
+    """Who takes part. With client data, only seats cleared for it (by default:
+    all enabled seats except China-based providers)."""
     if agents_arg:
         keys = [a.strip() for a in agents_arg.split(",") if a.strip()]
         for key in keys:
-            if not config.get(key).enabled:
+            spec = config.get(key)
+            if not spec.enabled:
                 raise CouncilError(f"agent '{key}' is disabled in council.toml")
+            if client_data and not spec.client_data:
+                raise CouncilError(
+                    f"{spec.label} is not cleared for client data (client_data = false in council.toml)"
+                )
         return keys
-    keys = [spec.key for spec in config.enabled()]
-    if not keys:
+    specs = config.enabled()
+    if client_data:
+        specs = [spec for spec in specs if spec.client_data]
+        if not specs:
+            raise CouncilError("no enabled seat is cleared for client data (client_data = true)")
+    if not specs:
         raise CouncilError("every agent is disabled in council.toml")
-    return keys
+    return [spec.key for spec in specs]
 
 
 def _timeout(args) -> float | None:
@@ -159,8 +170,9 @@ def cmd_new(args) -> int:
     thread = ws.create_thread(
         args.title,
         _read_question(args),
-        _participants(config, args.agents),
+        _participants(config, args.agents, args.client_data),
         [Path(p) for p in args.attach or []],
+        client_data=args.client_data,
     )
     print(f"created {thread.id}: {thread.path}")
     print(f"participants: {', '.join(thread.participants)}")
@@ -174,8 +186,11 @@ def _synth_agent(args, config: Config) -> str | None:
     name = (args.synth or "").strip().lower()
     if name in ("", "none"):
         return None
-    if not config.get(name).enabled:
+    spec = config.get(name)
+    if not spec.enabled:
         raise CouncilError(f"agent '{name}' is disabled in council.toml")
+    if getattr(args, "client_data", False) and not spec.client_data:
+        raise CouncilError(f"{spec.label} is not cleared for client data, so it cannot write this synthesis")
     return name
 
 
@@ -185,10 +200,13 @@ def cmd_ask(args) -> int:
     thread = ws.create_thread(
         args.title,
         _read_question(args),
-        _participants(config, args.agents),
+        _participants(config, args.agents, args.client_data),
         [Path(p) for p in args.attach or []],
+        client_data=args.client_data,
     )
     print(f"created {thread.id}: {thread.path}")
+    if thread.client_data:
+        print(f"client data: only {', '.join(thread.participants)} take part")
     on_event = _printer()
     code = _run_rounds(thread, config, args.rounds, args, on_event)
     if code == EXIT_OK and synth_by:
@@ -275,6 +293,7 @@ def cmd_status(args) -> int:
     print(f"{thread.id}: {thread.title}")
     print(f"folder:       {thread.path}")
     print(f"participants: {', '.join(thread.participants)}")
+    print(f"client data:  {'yes' if thread.client_data else 'no'}")
     print(f"state:        {thread.state()}")
     for record in thread.rounds:
         print(f"round {record['round']}:")
@@ -385,6 +404,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--attach", action="append", metavar="FILE",
                        help="file every agent may read (repeatable)")
         p.add_argument("--agents", help="comma list of participants (default: all enabled)")
+        p.add_argument("--client-data", action="store_true",
+                       help="the question contains client data: only seats cleared for it take part")
 
     p = sub.add_parser("init", help="create the workspace, config and git repo")
     p.set_defaults(func=cmd_init)

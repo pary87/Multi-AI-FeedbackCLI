@@ -56,6 +56,10 @@ from .store import (
 EventHandler = Callable[[dict], None]
 
 
+class RunStopped(CouncilError):
+    """Raised when a run is stopped from outside (the app's Stop button)."""
+
+
 def _no_events(_event: dict) -> None:
     pass
 
@@ -336,8 +340,10 @@ def run_agents(
     on_event: EventHandler = _no_events,
     context: dict | None = None,
     validator: Callable[[AgentResult], None] | None = None,
+    stop: threading.Event | None = None,
 ) -> dict[str, AgentResult]:
-    """Run every agent in parallel, each in its own view. Ctrl+C kills them all.
+    """Run every agent in parallel, each in its own view. Ctrl+C kills them all,
+    and so does setting `stop` (raises RunStopped). Either way nothing is saved.
 
     `validator` may downgrade an ok result (e.g. the ping checks the reply text).
     """
@@ -368,11 +374,13 @@ def run_agents(
     try:
         pending = set(futures)
         while pending:
+            if stop is not None and stop.is_set():
+                raise RunStopped("stopped: the running agents were closed and nothing from this run was saved")
             # Short waits keep Ctrl+C responsive on Windows, where an untimed wait is not.
             done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
             for fut in done:
                 results[futures[fut]] = fut.result()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, RunStopped):
         cancel.set()
         registry.kill_all()
         pool.shutdown(wait=True, cancel_futures=True)
@@ -400,6 +408,18 @@ def _participant_specs(thread: Thread, config: Config, keys: list[str]) -> list[
     return specs
 
 
+def _check_client_data(thread: Thread, specs: list[AgentSpec]) -> None:
+    if not thread.client_data:
+        return
+    blocked = [spec.label for spec in specs if not spec.client_data]
+    if blocked:
+        raise CouncilError(
+            f"{thread.id} contains client data, and {', '.join(blocked)} "
+            f"{'is' if len(blocked) == 1 else 'are'} not cleared for client data "
+            "(client_data = false in council.toml)"
+        )
+
+
 def _labels(thread: Thread, config: Config) -> dict[str, str]:
     return {key: config.get(key).label for key in thread.participants}
 
@@ -423,6 +443,7 @@ def run_round(
     timeout_s: float | None = None,
     keep_views: bool = False,
     on_event: EventHandler = _no_events,
+    stop: threading.Event | None = None,
 ) -> RunOutcome:
     """Run the next round, or (retry=True) re-run agents in the latest round.
 
@@ -470,6 +491,7 @@ def run_round(
     question = thread.question()
     labels = _labels(thread, config)
     specs = _participant_specs(thread, config, agents)
+    _check_client_data(thread, specs)
     attachments = thread.attachment_paths()
     prior = [(n, thread.responses(n)) for n in range(1, round_no)]
     prompts = {
@@ -497,6 +519,7 @@ def run_round(
         keep_views=keep_views,
         on_event=on_event,
         context=context,
+        stop=stop,
     )
 
     record = thread.round_record(round_no)
@@ -546,6 +569,7 @@ def run_synthesis(
     timeout_s: float | None = None,
     keep_views: bool = False,
     on_event: EventHandler = _no_events,
+    stop: threading.Event | None = None,
 ) -> RunOutcome:
     latest = thread.latest_round()
     if latest == 0:
@@ -559,6 +583,7 @@ def run_synthesis(
     spec = config.get(by)
     if not spec.enabled:
         raise CouncilError(f"agent '{by}' is disabled in council.toml")
+    _check_client_data(thread, [spec])
     labels = _labels(thread, config)
     if by not in labels:
         labels[by] = spec.label  # an outside agent may synthesise a thread it did not join
@@ -584,6 +609,7 @@ def run_synthesis(
         keep_views=keep_views,
         on_event=on_event,
         context=context,
+        stop=stop,
     )[by]
     entry = result.record()
     entry.update({"by": by, "after_round": latest})
@@ -613,6 +639,7 @@ def ping(
     *,
     timeout_s: float = 300,
     on_event: EventHandler = _no_events,
+    stop: threading.Event | None = None,
 ) -> RunOutcome:
     """Send each agent a trivial prompt through the real launch path.
 
@@ -639,6 +666,7 @@ def ping(
         on_event=on_event,
         context=context,
         validator=expect_token,
+        stop=stop,
     )
     return RunOutcome(
         "ping", None, results, complete=all(r.ok for r in results.values())

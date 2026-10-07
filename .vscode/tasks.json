@@ -19,6 +19,15 @@
       "problemMatcher": []
     },
     {
+      "label": "Council: open the app",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "council_app"],
+      "isBackground": true,
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
       "label": "Council: next round",
       "detail": "Run one more round of an existing thread.",
       "type": "process",

@@ -6,8 +6,9 @@ Two tools live in this repo:
 |---|---|
 | `council.py` | The v0 manual flow: it writes prompt files and you paste them into chatbot tabs. Milestones M1–M4. This branch does not change it, and its M1 TODO (`read_text_file`) is still yours to write. |
 | `council_engine/` | **The terminal council.** Claude Code, Codex CLI (ChatGPT), Kimi Code CLI and optionally GLM-5.3 answer the same question in rounds, and each round reads the one before. No copy-paste. |
+| `council_app/` | **The Council app.** A local web interface on top of the engine: ask, watch a run live, stop it, read threads, change settings. Start it with `Council.bat`. |
 
-The rest of this README covers `council_engine`.
+The rest of this README covers `council_engine` and `council_app`.
 
 ## How a thread runs
 
@@ -39,6 +40,7 @@ Each agent is launched through its vendor's own CLI, logged in with your subscri
 
   Every round is one git commit in the workspace.
 - **The question is locked.** If `00-question.md` is edited after round 1, the next run is refused, because earlier rounds answered the original text.
+- **Client data stays with cleared seats.** A thread marked as containing client data only runs seats with `client_data = true` in `council.toml`. Kimi and GLM (China-based providers) default to `false`. The engine refuses a round or synthesis that would break this, whatever the app or terminal asked for.
 - **Failures are contained.**
   - A failed or timed-out agent leaves its slot empty, and its stderr is saved to `logs/`.
   - The next round won't start until you either `retry` the agent or pass `--allow-partial`.
@@ -109,7 +111,7 @@ python -m council_engine synth T-0003 --by claude
 | Command | Purpose |
 |---|---|
 | `add-agent glm` | Add a ready-made seat to `council.toml` (currently: `glm`). |
-| `ask TITLE -q TEXT \| -f FILE [--attach F]... [--agents a,b] [--rounds N] [--synth AGENT]` | Create a thread and run it. |
+| `ask TITLE -q TEXT \| -f FILE [--attach F]... [--agents a,b] [--client-data] [--rounds N] [--synth AGENT]` | Create a thread and run it. `--client-data` keeps seats not cleared for client data out. |
 | `new` (same question options) | Create a thread without running it. |
 | `round THREAD [--allow-partial]` | Run the next round. |
 | `run THREAD --rounds N [--synth AGENT]` | Run until the thread has N complete rounds. |
@@ -130,6 +132,7 @@ Then use **Terminal > Run Task...** (or Ctrl+Shift+P, then "Run Task"). The task
 
 | Task | What it does |
 |---|---|
+| Council: open the app | Starts the Council app, like double-clicking `Council.bat`. Stop it with the trash-can icon on its terminal. |
 | Council: ask about the open file | The file open in the editor is the question. It asks for a title, the number of rounds and an optional synthesis agent, then runs everything. |
 | Council: next round / retry failed agents / synthesis | Asks for the thread ID. |
 | Council: status of all threads / one thread | Shows the state of the threads. |
@@ -151,13 +154,28 @@ To add another CLI, add an `[agents.<name>]` table to `council.toml`. No code ch
 
 Each vendor's model is reached only through that vendor's official CLI with its normal subscription login. The GLM seat uses Z.ai's documented Claude Code setup with a Z.ai key, in a separate Claude Code profile. The Claude subscription is never routed through a third-party harness. This setup is for personal use. If it becomes a product or service you sell, move Claude to API-key authentication.
 
-## Path to an app
+## The Council app
 
-The engine was built so a GUI can sit on top without touching the logic:
+The app is a local web page served by Python on this computer only (`http://127.0.0.1:8090`). Nothing outside the computer can reach it, and it refuses requests that carry another website's address, so a page you visit cannot drive it either. It uses the same engine as the terminal, so threads made in either place are the same folders.
 
-- **`runner.py`** exposes `run_round`, `run_synthesis` and `ping`. It never prints. Progress arrives through an `on_event` callback, one dict per event (`run_started`, `agent_started`, `agent_finished`, `run_finished`). The CLI is just one consumer of those events.
-- **`store.py`** makes the data model plain files plus `thread.json`. Any front end (a Streamlit page, a local web app, a desktop shell) can list threads, render rounds side by side, and call the same three functions.
-- **`council.toml`** stays the single source of truth for which agents exist.
+**One-time install** (from the repo folder):
+```
+python -m pip install -r requirements-app.txt
+```
+
+**Start it:** double-click `Council.bat` in the repo folder. A black window opens (keep it open) and the app opens in your browser. Closing the black window quits the app and stops any run in progress. Double-clicking again while it runs just opens the browser tab. From a terminal: `python -m council_app` (options: `--home FOLDER`, `--port 8090`, `--no-browser`).
+
+| Screen | What it does |
+|---|---|
+| Threads | Every thread, newest first, with status, rounds and synthesis. Click one to open it. |
+| New question | Title, question (or load a `.md` file), attachments, who takes part with a model level for this question only, the client-data switch, rounds (1 to 3) and who writes the synthesis. |
+| Live run | One card per agent with a live timer, the steps (rounds, then synthesis), an activity log, and **Stop run**. Stop closes every agent at once; nothing from the unfinished step is saved, and finished rounds stay saved. You can close the browser tab; the run continues while the black window is open. |
+| Thread | The question, the synthesis (switch between writers when there are several), every round's answers, and the audit trail of commits. Buttons: Continue (finish a stopped or interrupted plan), One more round, Synthesize with, Retry failed, Open folder. |
+| Settings | Model levels per seat, the time limit, Test connections, which seats may see client data, GitHub sync (Upload now, upload after every round) and the workspace folder. Save writes `council.toml`, keeping its comments, and commits it. |
+
+Agent replies are shown as formatted Markdown with any HTML in them neutralised, so a reply cannot run code in the page. Kimi's terminal-style list formatting is removed so its headings and tables render properly.
+
+How it fits together: `council_engine/runner.py` reports progress through an `on_event` callback and takes a `stop` event; `council_app/jobs.py` runs one job at a time on a worker thread and keeps the live state the pages poll; `council_app/server.py` holds the five pages (NiceGUI); `council_engine/config_edit.py` changes `council.toml` in place.
 
 ## Tests
 
@@ -165,7 +183,7 @@ The engine was built so a GUI can sit on top without touching the logic:
 python -m unittest discover -s tests -v
 ```
 
-There are 31 tests. They use `tests/fake_agent.py` in place of the real CLIs. It reports exactly what it was shown, which lets the tests prove:
+There are 62 tests (`tests/test_engine.py` and `tests/test_app.py`). They use `tests/fake_agent.py` in place of the real CLIs. It reports exactly what it was shown, which lets the tests prove:
 
 - round-1 blindness;
 - the round-2 transcript;
@@ -180,4 +198,11 @@ There are 31 tests. They use `tests/fake_agent.py` in place of the real CLIs. It
 - per-seat environment variables, missing-variable errors, and secrets never reaching saved files or git history;
 - stripping of credentials a seat must not see;
 - automatic upload to a remote, and that a failed upload never fails a run;
+- the client-data guard, in the engine, the terminal and the app;
+- Stop: every agent process is killed and nothing is saved;
+- editing `council.toml` (levels, client data, time limit, upload) without losing comments, and per-question levels that leave the file alone;
+- the app's run manager: full runs, one run at a time, failed seats and retries, connection tests;
+- that the app only answers this computer's own browser;
 - the full CLI flow.
+
+The pages themselves were checked by clicking through every screen in a real browser against stand-in agents.
