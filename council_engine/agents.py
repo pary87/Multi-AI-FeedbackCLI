@@ -1,0 +1,270 @@
+"""Agent adapters: how each vendor CLI is launched, read from council.toml.
+
+Nothing here is specific to one vendor. Every difference between Claude Code,
+Codex CLI and Kimi Code CLI lives in the config file as data, so a CLI update
+that renames a flag is a one-line edit to council.toml, not a code change.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .store import CouncilError
+
+# The flags below were checked against the --help output of
+# Claude Code 2.1.292, Codex CLI 0.160.1 and Kimi Code CLI 2.1.1 (2026-10-06).
+DEFAULT_CONFIG_TOML = r'''# council.toml -- which AI command-line agents take part, and exactly how each is launched.
+#
+# Each agent runs in its own throwaway folder containing only ROUND.md (plus any
+# thread attachments). Every agent gets the same one-line instruction -- "read
+# ROUND.md and follow it" -- and its final reply is saved as its response.
+#
+# Placeholders usable inside `command`:
+#   {instruction}   the fixed one-line instruction (required)
+#   {output_file}   where the agent must write its reply (required when capture = "file")
+#   {view_dir}      the agent's throwaway working folder
+#   {council_dir}   this workspace's .council folder
+#
+# capture = "stdout"  -> whatever the agent prints is its reply
+# capture = "file"    -> the agent writes its reply to {output_file}
+#
+# Flags checked against Claude Code 2.1.292, Codex CLI 0.160.1, Kimi Code CLI 2.1.1.
+# If an update renames a flag, fix it here; no code change is needed.
+
+[defaults]
+timeout_minutes = 20   # per agent, per round
+
+[agents.claude]
+label = "Claude"
+enabled = true
+# -p: non-interactive. --tools: only read/search tools exist, so it cannot write.
+# --strict-mcp-config: your MCP servers stay out of council rounds.
+command = [
+  "claude", "-p", "{instruction}",
+  "--output-format", "text",
+  "--tools", "Read,Glob,Grep",
+  "--permission-prompts", "none",
+  "--strict-mcp-config",
+  "--no-session-persistence",
+]
+capture = "stdout"
+version_command = ["claude", "--version"]
+install_hint = "Install Claude Code and log in with your Claude plan: https://docs.claude.com/en/docs/claude-code"
+
+[agents.chatgpt]
+label = "ChatGPT"
+enabled = true
+# exec: non-interactive. read-only sandbox. -o: write only the final message.
+command = [
+  "codex", "exec",
+  "--sandbox", "read-only",
+  "--skip-git-repo-check",
+  "--ephemeral",
+  "--color", "never",
+  "-o", "{output_file}",
+  "{instruction}",
+]
+capture = "file"
+version_command = ["codex", "--version"]
+install_hint = "npm install -g @openai/codex   then: codex login   (choose Sign in with ChatGPT)"
+
+[agents.kimi]
+label = "Kimi"
+enabled = true
+# -p: non-interactive. Kimi has no read-only switch in -p mode, so --agent-file
+# gives it a profile whose only tools are Read, Glob and Grep.
+command = [
+  "kimi", "-p", "{instruction}",
+  "--output-format", "text",
+  "--agent-file", "{council_dir}/kimi-council-member.md",
+]
+capture = "stdout"
+version_command = ["kimi", "--version"]
+install_hint = "npm install -g @moonshot-ai/kimi-code   then: kimi login --region global"
+# strip_regex = ['(?s)\n+SOME FOOTER TEXT.*\Z']   # regexes removed from the reply, if a CLI adds noise
+'''
+
+ALLOWED_PLACEHOLDERS = {"instruction", "output_file", "view_dir", "council_dir"}
+PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_]+)\}")
+AGENT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+# Characters cmd.exe reinterprets even inside quotes when Windows launches a
+# .cmd/.bat wrapper (npm-installed CLIs are such wrappers on Windows).
+CMD_METACHARS = set('%^&|<>"!')
+
+
+class AgentNotFound(CouncilError):
+    pass
+
+
+@dataclass
+class AgentSpec:
+    key: str
+    label: str
+    command: list[str]
+    capture: str = "stdout"
+    enabled: bool = True
+    timeout_s: float | None = None
+    version_command: list[str] | None = None
+    strip_regex: list[str] = field(default_factory=list)
+    install_hint: str = ""
+
+
+@dataclass
+class Config:
+    agents: dict[str, AgentSpec]
+    timeout_s: float
+
+    def enabled(self) -> list[AgentSpec]:
+        return [a for a in self.agents.values() if a.enabled]
+
+    def get(self, key: str) -> AgentSpec:
+        if key not in self.agents:
+            known = ", ".join(self.agents) or "none"
+            raise CouncilError(f"unknown agent '{key}' (configured: {known})")
+        return self.agents[key]
+
+    def timeout_for(self, spec: AgentSpec) -> float:
+        return spec.timeout_s if spec.timeout_s is not None else self.timeout_s
+
+
+def _str_list(value, where: str) -> list[str]:
+    if not isinstance(value, list) or not value or not all(isinstance(v, str) for v in value):
+        raise CouncilError(f"{where} must be a non-empty list of strings")
+    return list(value)
+
+
+def load_config(path: Path) -> Config:
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise CouncilError(f"config not found: {path}") from None
+    except tomllib.TOMLDecodeError as exc:
+        raise CouncilError(f"{path.name} is not valid TOML: {exc}") from None
+
+    defaults = data.get("defaults", {})
+    timeout_s = float(defaults.get("timeout_minutes", 20)) * 60
+    table = data.get("agents")
+    if not isinstance(table, dict) or not table:
+        raise CouncilError(f"{path.name} defines no [agents.<name>] tables")
+
+    agents: dict[str, AgentSpec] = {}
+    for key, raw in table.items():
+        where = f"[agents.{key}]"
+        if not AGENT_KEY_RE.match(key):
+            raise CouncilError(f"{where}: names must be lowercase letters, digits and dashes")
+        command = _str_list(raw.get("command"), f"{where} command")
+        capture = raw.get("capture", "stdout")
+        if capture not in ("stdout", "file"):
+            raise CouncilError(f"{where} capture must be \"stdout\" or \"file\"")
+        used = {name for arg in command for name in PLACEHOLDER_RE.findall(arg)}
+        unknown = used - ALLOWED_PLACEHOLDERS
+        if unknown:
+            raise CouncilError(f"{where} command uses unknown placeholder(s): {sorted(unknown)}")
+        if "instruction" not in used:
+            raise CouncilError(f"{where} command must pass {{instruction}} to the agent")
+        if capture == "file" and "output_file" not in used:
+            raise CouncilError(f"{where} uses capture = \"file\" but never passes {{output_file}}")
+        for pattern in raw.get("strip_regex", []):
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise CouncilError(f"{where} strip_regex {pattern!r} is invalid: {exc}") from None
+        minutes = raw.get("timeout_minutes")
+        agents[key] = AgentSpec(
+            key=key,
+            label=str(raw.get("label", key)),
+            command=command,
+            capture=capture,
+            enabled=bool(raw.get("enabled", True)),
+            timeout_s=float(minutes) * 60 if minutes is not None else None,
+            version_command=(
+                _str_list(raw["version_command"], f"{where} version_command")
+                if "version_command" in raw
+                else None
+            ),
+            strip_regex=list(raw.get("strip_regex", [])),
+            install_hint=str(raw.get("install_hint", "")),
+        )
+    return Config(agents=agents, timeout_s=timeout_s)
+
+
+def render_command(spec: AgentSpec, values: dict[str, str]) -> list[str]:
+    out = []
+    for arg in spec.command:
+        for name, value in values.items():
+            arg = arg.replace("{" + name + "}", value)
+        out.append(arg)
+    return out
+
+
+def resolve_executable(argv: list[str], spec: AgentSpec) -> list[str]:
+    """Replace argv[0] with its full path. shutil.which honours PATHEXT, so on
+    Windows 'codex' finds codex.cmd / codex.exe exactly as a terminal would."""
+    found = shutil.which(argv[0])
+    if found is None:
+        hint = f" Install: {spec.install_hint}" if spec.install_hint else ""
+        raise AgentNotFound(f"'{argv[0]}' is not on PATH.{hint}")
+    return [found, *argv[1:]]
+
+
+def check_batch_wrapper_args(argv: list[str], is_windows: bool | None = None) -> None:
+    """Refuse arguments that cmd.exe would mangle when launching a .cmd/.bat shim.
+
+    The instruction text is fixed and contains none of these characters; this
+    guard is for paths (e.g. a Windows user name containing '&').
+    """
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    if not is_windows or not argv[0].lower().endswith((".cmd", ".bat")):
+        return
+    for arg in argv[1:]:
+        bad = sorted(set(arg) & CMD_METACHARS)
+        if bad:
+            raise CouncilError(
+                f"{Path(argv[0]).name} is a batch-file wrapper, and cmd.exe would reinterpret "
+                f"{' '.join(bad)} in the argument {arg!r}. Move the workspace to a path "
+                "without those characters (COUNCIL_HOME or --home)."
+            )
+
+
+def clean_output(text: str, strip_regex: list[str] | None = None) -> str:
+    """Normalise a reply: LF endings, no terminal colour codes, configured noise removed."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = ANSI_RE.sub("", text)
+    for pattern in strip_regex or []:
+        text = re.sub(pattern, "", text)
+    text = text.strip()
+    return text + "\n" if text else ""
+
+
+def child_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["NO_COLOR"] = "1"
+    return env
+
+
+def probe_version(spec: AgentSpec, timeout: float = 30) -> str | None:
+    if not spec.version_command:
+        return None
+    try:
+        argv = resolve_executable(list(spec.version_command), spec)
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            env=child_env(),
+        )
+    except (CouncilError, OSError, subprocess.TimeoutExpired):
+        return None
+    text = (proc.stdout or proc.stderr).decode("utf-8", errors="replace")
+    lines = [line.strip() for line in clean_output(text).splitlines() if line.strip()]
+    return lines[0] if lines else None
