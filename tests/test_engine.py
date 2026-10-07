@@ -62,6 +62,13 @@ strip_regex = ['(?s)\\n*\\[session saved:.*\\Z']
 
 def _alive(pid: int) -> bool:
     """True if `pid` is running. A killed-but-unreaped zombie counts as dead."""
+    if os.name == "nt":
+        # os.kill(pid, 0) on Windows sends CTRL_C_EVENT instead of probing, so ask tasklist.
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        ).stdout
+        return f'"{pid}"' in out
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -236,7 +243,6 @@ class FailureTests(EngineTestCase):
         self.assertEqual(entry["status"], "failed")
         self.assertIn("nothing", entry["detail"])
 
-    @unittest.skipIf(os.name == "nt", "process-group check uses POSIX signals")
     def test_timeout_kills_whole_process_tree(self) -> None:
         thread = self.new_thread()
         pidfile = Path(self._tmp.name) / "pids.txt"
