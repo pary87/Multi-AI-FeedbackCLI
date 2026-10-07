@@ -368,6 +368,15 @@ class CliTests(EngineTestCase):
         self.assertIn("synthesis by claude after round 2: ok", out)
         self.run_cli("round", "T-9999", expect=2)
 
+    def test_cli_synth_none_and_early_agent_check(self) -> None:
+        out = self.run_cli("ask", "t", "-q", "q?", "--rounds", "1", "--synth", "none")
+        self.assertIn("round 1 complete", out)
+        self.assertNotIn("synthesis", out)
+        # A misspelt synthesis agent fails before any round runs or thread is created.
+        out = self.run_cli("ask", "t2", "-q", "q?", "--synth", "chatgtp", expect=2)
+        self.assertIn("unknown agent 'chatgtp'", out)
+        self.assertEqual(len(self.ws.thread_dirs()), 1)
+
     @unittest.skipIf(os.name == "nt", "sends SIGINT")
     def test_ctrl_c_stops_agents_and_saves_nothing(self) -> None:
         import signal

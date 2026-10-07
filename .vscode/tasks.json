@@ -1,0 +1,132 @@
+{
+  "version": "2.0.0",
+  "options": {
+    "cwd": "${workspaceFolder}"
+  },
+  "tasks": [
+    {
+      "label": "Council: ask about the open file",
+      "detail": "The file open in the editor is the question. Runs the rounds, then the optional synthesis.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-m", "council_engine", "ask", "${input:councilTitle}",
+        "-f", "${file}",
+        "--rounds", "${input:councilRounds}",
+        "--synth", "${input:councilSynth}"
+      ],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Council: next round",
+      "detail": "Run one more round of an existing thread.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "council_engine", "round", "${input:councilThread}"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Council: retry failed agents",
+      "detail": "Re-run whichever agents failed in a thread's latest round.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "council_engine", "retry", "${input:councilThread}"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Council: synthesis",
+      "detail": "One agent writes the synthesis of a thread.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "council_engine", "synth", "${input:councilThread}", "--by", "${input:councilAgent}"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Council: status of all threads",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "council_engine", "status"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Council: status of one thread",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "council_engine", "status", "${input:councilThread}"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Council: doctor (check installs and logins)",
+      "detail": "Sends each agent a one-word test prompt through the real launch path.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "council_engine", "doctor", "--ping"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Council: create workspace (first time only)",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "council_engine", "init"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Council: add the threads folder to this window",
+      "detail": "Shows ~/council beside the code in the Explorer, so replies open in the editor.",
+      "type": "shell",
+      "command": "code",
+      "args": ["--add", "${userHome}/council"],
+      "presentation": { "reveal": "silent" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Council: run tests",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "unittest", "discover", "-s", "tests", "-v"],
+      "group": { "kind": "test", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "councilTitle",
+      "type": "promptString",
+      "description": "Thread title (becomes part of the folder name)"
+    },
+    {
+      "id": "councilRounds",
+      "type": "pickString",
+      "description": "How many rounds?",
+      "options": ["1", "2", "3"],
+      "default": "2"
+    },
+    {
+      "id": "councilSynth",
+      "type": "pickString",
+      "description": "Who writes the synthesis afterwards?",
+      "options": ["none", "claude", "chatgpt", "kimi"],
+      "default": "none"
+    },
+    {
+      "id": "councilThread",
+      "type": "promptString",
+      "description": "Thread: T-0003, 3, or the folder name"
+    },
+    {
+      "id": "councilAgent",
+      "type": "pickString",
+      "description": "Which agent writes the synthesis?",
+      "options": ["claude", "chatgpt", "kimi"]
+    }
+  ]
+}

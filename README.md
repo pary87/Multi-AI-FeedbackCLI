@@ -99,6 +99,24 @@ python -m council_engine synth T-0003 --by claude
 
 Results land in `%USERPROFILE%\council\threads\T-0003-...\`. That folder holds `r1-claude.md`, `r1-chatgpt.md`, `r1-kimi.md`, `r2-...`, `synthesis-...`, and `thread.json`.
 
+## Using it from VS Code
+
+Open the repo folder in VS Code and install the recommended extensions when prompted. Python is required, because the tasks run with the interpreter you select there. Claude Code and Codex are optional for the council itself.
+
+Then use **Terminal > Run Task...** (or Ctrl+Shift+P, then "Run Task"). The task list includes:
+
+| Task | What it does |
+|---|---|
+| Council: ask about the open file | The file open in the editor is the question. It asks for a title, the number of rounds and an optional synthesis agent, then runs everything. |
+| Council: next round / retry failed agents / synthesis | Asks for the thread ID. |
+| Council: status of all threads / one thread | Shows the state of the threads. |
+| Council: doctor (check installs and logins) | The same as `doctor --ping`. |
+| Council: create workspace (first time only) | The same as `init`. |
+| Council: add the threads folder to this window | Puts `~/council` in the Explorer, so replies open as Markdown beside the code. |
+| Council: run tests | The default test task. The Testing panel also discovers the tests. |
+
+The workspace settings put the repo on `PYTHONPATH` in VS Code terminals, so `python -m council_engine ...` works from any folder there. Attachments still go through the terminal: `--attach "C:\path\file.pdf"`.
+
 ## When a CLI update breaks something
 
 Each CLI's launch details (flags, read-only switches, capture mode) are stored as data in the workspace's `council.toml`, not in code. If a vendor renames a flag, edit that line and re-run `doctor --ping`. The defaults were checked against the `--help` output of Claude Code 2.1.292, Codex CLI 0.160.1 and Kimi Code CLI 2.1.1.

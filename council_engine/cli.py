@@ -159,8 +159,20 @@ def cmd_new(args) -> int:
     return EXIT_OK
 
 
+def _synth_agent(args, config: Config) -> str | None:
+    """The --synth agent, or None for 'none'. Checked up front so a typo fails
+    before the rounds run, not after."""
+    name = (args.synth or "").strip().lower()
+    if name in ("", "none"):
+        return None
+    if not config.get(name).enabled:
+        raise CouncilError(f"agent '{name}' is disabled in council.toml")
+    return name
+
+
 def cmd_ask(args) -> int:
     ws, config = _open(args)
+    synth_by = _synth_agent(args, config)
     thread = ws.create_thread(
         args.title,
         _read_question(args),
@@ -170,8 +182,8 @@ def cmd_ask(args) -> int:
     print(f"created {thread.id}: {thread.path}")
     on_event = _printer()
     code = _run_rounds(thread, config, args.rounds, args, on_event)
-    if code == EXIT_OK and args.synth:
-        code = _synth(thread, config, args.synth, args, on_event)
+    if code == EXIT_OK and synth_by:
+        code = _synth(thread, config, synth_by, args, on_event)
     return code
 
 
@@ -191,11 +203,12 @@ def cmd_round(args) -> int:
 
 def cmd_run(args) -> int:
     ws, config = _open(args)
+    synth_by = _synth_agent(args, config)
     thread = ws.thread(args.thread)
     on_event = _printer()
     code = _run_rounds(thread, config, args.rounds, args, on_event)
-    if code == EXIT_OK and args.synth:
-        code = _synth(thread, config, args.synth, args, on_event)
+    if code == EXIT_OK and synth_by:
+        code = _synth(thread, config, synth_by, args, on_event)
     return code
 
 
@@ -349,7 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ask", help="create a thread and run it (default: 2 rounds)")
     question_opts(p)
     p.add_argument("--rounds", type=int, default=2, help="rounds to run (default 2)")
-    p.add_argument("--synth", metavar="AGENT", help="then have AGENT write the synthesis")
+    p.add_argument("--synth", metavar="AGENT", help="then have AGENT write the synthesis ('none' = skip)")
     run_opts(p)
     p.set_defaults(func=cmd_ask)
 
@@ -363,7 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run", help="run rounds until the thread has N complete rounds")
     p.add_argument("thread")
     p.add_argument("--rounds", type=int, required=True)
-    p.add_argument("--synth", metavar="AGENT", help="then have AGENT write the synthesis")
+    p.add_argument("--synth", metavar="AGENT", help="then have AGENT write the synthesis ('none' = skip)")
     run_opts(p)
     p.set_defaults(func=cmd_run)
 
