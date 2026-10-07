@@ -39,6 +39,9 @@ DEFAULT_CONFIG_TOML = r'''# council.toml -- which AI command-line agents take pa
 
 [defaults]
 timeout_minutes = 20   # per agent, per round
+auto_push = true       # after every round, upload threads to GitHub (only if the workspace has an "origin" remote)
+
+# More ready-made seats: python -m council_engine add-agent glm   (GLM-5.3 via the Z.ai GLM Coding Plan)
 
 [agents.claude]
 label = "Claude"
@@ -90,8 +93,48 @@ install_hint = "npm install -g @moonshot-ai/kimi-code   then: kimi login --regio
 # strip_regex = ['(?s)\n+SOME FOOTER TEXT.*\Z']   # regexes removed from the reply, if a CLI adds noise
 '''
 
+# Ready-made seats that `python -m council_engine add-agent <name>` appends to council.toml.
+PRESETS: dict[str, str] = {
+    "glm": r'''
+[agents.glm]
+label = "GLM"
+enabled = true
+# GLM-5.3 on the Z.ai GLM Coding Plan, run through Claude Code pointed at Z.ai
+# (the setup Z.ai documents). It gets its own Claude Code profile folder, so your
+# normal Claude seat and your Anthropic login are never touched or sent to Z.ai.
+# Needs the user environment variable ZAI_API_KEY holding your Z.ai API key.
+command = [
+  "claude", "-p", "{instruction}",
+  "--model", "glm-5.3",
+  "--output-format", "text",
+  "--tools", "Read,Glob,Grep",
+  "--permission-prompts", "none",
+  "--strict-mcp-config",
+  "--no-session-persistence",
+]
+capture = "stdout"
+version_command = ["claude", "--version"]
+install_hint = "Uses Claude Code (already installed). Subscribe to a Z.ai GLM Coding Plan and set ZAI_API_KEY."
+# Never let an Anthropic credential ride along to Z.ai: with ANTHROPIC_API_KEY set,
+# Claude Code would send it as an extra header even when pointed at another server.
+unset_env = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
+
+[agents.glm.env]
+CLAUDE_CONFIG_DIR = "{home}/.claude-glm"
+ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
+ANTHROPIC_AUTH_TOKEN = "${ZAI_API_KEY}"
+ANTHROPIC_DEFAULT_OPUS_MODEL = "glm-5.3"
+ANTHROPIC_DEFAULT_SONNET_MODEL = "glm-5.3"
+ANTHROPIC_DEFAULT_HAIKU_MODEL = "glm-5.3-flash"
+API_TIMEOUT_MS = "3000000"
+''',
+}
+
 ALLOWED_PLACEHOLDERS = {"instruction", "output_file", "view_dir", "council_dir"}
+ENV_PLACEHOLDERS = {"home", "council_dir"}
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_]+)\}")
+ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 AGENT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
@@ -101,6 +144,10 @@ CMD_METACHARS = set('%^&|<>"!')
 
 
 class AgentNotFound(CouncilError):
+    pass
+
+
+class AgentEnvMissing(CouncilError):
     pass
 
 
@@ -115,12 +162,22 @@ class AgentSpec:
     version_command: list[str] | None = None
     strip_regex: list[str] = field(default_factory=list)
     install_hint: str = ""
+    # Extra environment variables for this agent's process only. Values may use
+    # ${NAME} (taken from your OS environment at launch) and {home}/{council_dir}.
+    env: dict[str, str] = field(default_factory=dict)
+    # Variables removed from this agent's process (e.g. credentials it must not see).
+    unset_env: list[str] = field(default_factory=list)
+
+    def env_refs(self) -> list[str]:
+        """Names of the OS environment variables this agent's env table needs."""
+        return sorted({n for v in self.env.values() for n in ENV_REF_RE.findall(v)})
 
 
 @dataclass
 class Config:
     agents: dict[str, AgentSpec]
     timeout_s: float
+    auto_push: bool = True
 
     def enabled(self) -> list[AgentSpec]:
         return [a for a in self.agents.values() if a.enabled]
@@ -177,6 +234,12 @@ def load_config(path: Path) -> Config:
                 re.compile(pattern)
             except re.error as exc:
                 raise CouncilError(f"{where} strip_regex {pattern!r} is invalid: {exc}") from None
+        env = _parse_env(raw.get("env", {}), where)
+        unset_env = raw.get("unset_env", [])
+        if not isinstance(unset_env, list) or not all(
+            isinstance(n, str) and ENV_NAME_RE.match(n) for n in unset_env
+        ):
+            raise CouncilError(f"{where} unset_env must be a list of environment variable names")
         minutes = raw.get("timeout_minutes")
         agents[key] = AgentSpec(
             key=key,
@@ -192,8 +255,80 @@ def load_config(path: Path) -> Config:
             ),
             strip_regex=list(raw.get("strip_regex", [])),
             install_hint=str(raw.get("install_hint", "")),
+            env=env,
+            unset_env=list(unset_env),
         )
-    return Config(agents=agents, timeout_s=timeout_s)
+    auto_push = defaults.get("auto_push", True)
+    if not isinstance(auto_push, bool):
+        raise CouncilError("[defaults] auto_push must be true or false")
+    return Config(agents=agents, timeout_s=timeout_s, auto_push=auto_push)
+
+
+def _parse_env(raw, where: str) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        raise CouncilError(f"{where} env must be a table of NAME = \"value\" lines")
+    env: dict[str, str] = {}
+    for name, value in raw.items():
+        if not ENV_NAME_RE.match(name):
+            raise CouncilError(f"{where} env: {name!r} is not a valid environment variable name")
+        if not isinstance(value, str):
+            raise CouncilError(f"{where} env: {name} must be a quoted string")
+        unknown = set(PLACEHOLDER_RE.findall(ENV_REF_RE.sub("", value))) - ENV_PLACEHOLDERS
+        if unknown:
+            raise CouncilError(
+                f"{where} env: {name} uses unknown placeholder(s) {sorted(unknown)}; "
+                "use {home}, {council_dir} or ${OS_VARIABLE}"
+            )
+        env[name] = value
+    return env
+
+
+def resolve_env(spec: AgentSpec, council_dir: Path) -> tuple[dict[str, str], list[str]]:
+    """Expand an agent's env table at launch.
+
+    Returns (variables, secrets): the expanded variables, and the values that came
+    from ${...} references, so callers can scrub them from anything they save.
+    Raises AgentEnvMissing naming (never revealing) any referenced variable that
+    is not set.
+    """
+    missing = [name for name in spec.env_refs() if not os.environ.get(name)]
+    if missing:
+        raise AgentEnvMissing(
+            f"environment variable {', '.join(missing)} is not set "
+            f"(needed by [agents.{spec.key}] in council.toml). Set it, then reopen the terminal."
+        )
+    secrets = [os.environ[name] for name in spec.env_refs()]
+    out: dict[str, str] = {}
+    for name, value in spec.env.items():
+        value = ENV_REF_RE.sub(lambda m: os.environ[m.group(1)], value)
+        value = value.replace("{home}", str(Path.home())).replace("{council_dir}", str(council_dir))
+        out[name] = value
+    return out, secrets
+
+
+def redact(text: str, secrets: list[str]) -> str:
+    for secret in secrets:
+        if secret and len(secret) >= 6:
+            text = text.replace(secret, "[redacted]")
+    return text
+
+
+def add_preset(config_path: Path, name: str) -> str:
+    """Append a ready-made seat to council.toml. Returns the agent's label."""
+    if name not in PRESETS:
+        raise CouncilError(f"no ready-made seat called '{name}' (available: {', '.join(PRESETS)})")
+    original = config_path.read_text(encoding="utf-8")
+    if re.search(rf"^\[agents\.{re.escape(name)}\]", original, flags=re.M):
+        raise CouncilError(f"council.toml already has an [agents.{name}] seat")
+    updated = original.rstrip("\n") + "\n" + PRESETS[name]
+    with open(config_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(updated)
+    try:
+        return load_config(config_path).get(name).label
+    except CouncilError:
+        with open(config_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(original)
+        raise
 
 
 def render_command(spec: AgentSpec, values: dict[str, str]) -> list[str]:
@@ -245,9 +380,14 @@ def clean_output(text: str, strip_regex: list[str] | None = None) -> str:
     return text + "\n" if text else ""
 
 
-def child_env() -> dict[str, str]:
+def child_env(extra: dict[str, str] | None = None, unset: list[str] | None = None) -> dict[str, str]:
     env = dict(os.environ)
     env["NO_COLOR"] = "1"
+    for name in unset or []:
+        # Windows variable names are case-insensitive; match them that way there.
+        for key in [k for k in env if k == name or (os.name == "nt" and k.upper() == name.upper())]:
+            del env[key]
+    env.update(extra or {})
     return env
 
 

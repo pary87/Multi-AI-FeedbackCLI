@@ -99,6 +99,10 @@ def git_available() -> bool:
 @dataclass
 class Workspace:
     root: Path
+    # When true and the workspace has an "origin" remote, every commit is pushed.
+    auto_push: bool = False
+    # Outcome of the most recent push: "pushed", "no remote", "failed: ...", or None.
+    last_push: str | None = None
 
     @property
     def threads_dir(self) -> Path:
@@ -186,6 +190,7 @@ class Workspace:
         Uses your own git identity when one is configured; otherwise commits as
         "council" so a fresh machine never fails a round over missing git config.
         """
+        self.last_push = None
         if not self.is_git_repo():
             return None
         rel = [str(p.resolve().relative_to(self.root)) for p in paths if p.exists()]
@@ -198,7 +203,39 @@ class Workspace:
         if self.git("config", "user.email", check=False).returncode != 0:
             identity = ["-c", "user.name=council", "-c", "user.email=council@localhost"]
         self.git(*identity, "commit", "-q", "-m", message)
+        if self.auto_push:
+            self.last_push = self.push()
         return self.git("rev-parse", "--short", "HEAD").stdout.strip()
+
+    def remote_url(self) -> str | None:
+        if not self.is_git_repo():
+            return None
+        proc = self.git("remote", "get-url", "origin", check=False)
+        return proc.stdout.strip() or None if proc.returncode == 0 else None
+
+    def push(self) -> str:
+        """Push the current branch to origin. Never raises and never waits for a
+        password prompt: a failure is reported and the threads stay safe locally."""
+        if self.remote_url() is None:
+            return "no remote"
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(self.root), "push", "--quiet", "origin", "HEAD"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdin=subprocess.DEVNULL,
+                env=env,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"failed: {exc.__class__.__name__}"
+        if proc.returncode == 0:
+            return "pushed"
+        lines = [line.strip() for line in (proc.stderr or proc.stdout).splitlines() if line.strip()]
+        return "failed: " + (lines[-1][:200] if lines else f"exit code {proc.returncode}")
 
     # -- threads -------------------------------------------------------------
 

@@ -9,6 +9,7 @@ Behaviour per agent comes from the environment variable FAKE_MODE_<NAME>:
     fail     print an error to stderr and exit 3
     empty    exit 0 with no reply
     hang     start a grandchild, write both PIDs to $FAKE_PIDFILE, sleep 300 s
+--echo-env NAME (repeatable) adds "env_NAME: <value>" to the reply and to stderr.
     tamper   plant a file in the working folder, then reply normally
     footer   reply normally plus a trailing session footer
     badping  answer a ping with the wrong text
@@ -27,6 +28,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--name", required=True)
 parser.add_argument("--instruction", required=True)
 parser.add_argument("--out", help="write the reply here instead of stdout")
+parser.add_argument("--echo-env", action="append", default=[],
+                    help="report this environment variable (in the reply and on stderr)")
 args = parser.parse_args()
 mode = os.environ.get(f"FAKE_MODE_{args.name.upper()}", "normal")
 
@@ -73,9 +76,14 @@ if mode == "tamper":
 if mode == "empty":
     sys.exit(0)
 
+env_lines = [f"env_{name}: {os.environ.get(name, '<unset>')}" for name in args.echo_env]
+for line in env_lines:
+    print(line, file=sys.stderr)
+
 report = "\n".join(
     [
         f"FAKE {args.name}",
+        *env_lines,
         f"header: {first_line}",
         "seen: " + (",".join(f"{who}@{rnd}" for who, rnd in seen) or "none"),
         "missing: " + (",".join(f"{who}@{rnd}" for who, rnd in missing) or "none"),

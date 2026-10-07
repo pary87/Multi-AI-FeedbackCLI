@@ -4,13 +4,14 @@ so a GUI can offer the same operations by calling those functions directly."""
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 import threading
 from pathlib import Path
 
 from . import __version__
-from .agents import Config, load_config, probe_version
+from .agents import PRESETS, Config, add_preset, load_config, probe_version
 from .runner import RunOutcome, ping, run_round, run_synthesis
 from .store import CouncilError, Thread, Workspace, default_home, git_available
 
@@ -49,6 +50,12 @@ def _printer():
                 line = f"{tag} saved and committed ({event['commit']})"
             else:
                 line = f"{tag} saved"
+            push = event.get("push")
+            if push == "pushed":
+                line += " and uploaded to GitHub"
+            elif push and push.startswith("failed"):
+                line += (f"\n{tag} warning: upload to GitHub {push}. Your threads are safe on this"
+                         " computer; the next successful run uploads everything.")
         else:
             return
         with lock:
@@ -59,7 +66,9 @@ def _printer():
 
 def _open(args) -> tuple[Workspace, Config]:
     ws = Workspace.open(Path(args.home))
-    return ws, load_config(ws.config_path)
+    config = load_config(ws.config_path)
+    ws.auto_push = config.auto_push
+    return ws, config
 
 
 def _read_question(args) -> str:
@@ -289,6 +298,13 @@ def cmd_doctor(args) -> int:
     print(f"council_engine {__version__}, python {sys.version.split()[0]}")
     git = "yes" if ws.is_git_repo() else ("installed, workspace not a repo" if git_available() else "not found")
     print(f"workspace: {ws.root}  (git: {git})")
+    remote = ws.remote_url()
+    if remote and config.auto_push:
+        print(f"sync: uploads to {remote} after every round")
+    elif remote:
+        print(f"sync: off (auto_push = false); remote is {remote}")
+    else:
+        print("sync: no GitHub remote, so threads stay on this computer")
     problems = 0
     selected = [s.strip() for s in args.agents.split(",")] if args.agents else None
     specs = [config.get(a) for a in selected] if selected else list(config.agents.values())
@@ -305,9 +321,17 @@ def cmd_doctor(args) -> int:
             continue
         version = probe_version(spec) or "version unknown"
         print(f"  {spec.key:<8} {version}  [{exe}]")
+        missing = [name for name in spec.env_refs() if not os.environ.get(name)]
+        if missing:
+            problems += 1
+            print(f"  {'':<8} MISSING environment variable: {', '.join(missing)}")
     if args.ping:
         print("pinging each agent through the real launch path (may take a minute)...")
-        enabled = [s.key for s in specs if s.enabled and shutil.which(s.command[0])]
+        enabled = [
+            s.key for s in specs
+            if s.enabled and shutil.which(s.command[0])
+            and all(os.environ.get(name) for name in s.env_refs())
+        ]
         if enabled:
             outcome = ping(ws, config, enabled, on_event=_printer())
             problems += sum(1 for r in outcome.results.values() if not r.ok)
@@ -315,6 +339,21 @@ def cmd_doctor(args) -> int:
         print(f"{problems} problem(s) found")
         return EXIT_INCOMPLETE
     print("all good" if args.ping else "all agents found (add --ping to test logins)")
+    return EXIT_OK
+
+
+def cmd_add_agent(args) -> int:
+    ws, _config = _open(args)
+    label = add_preset(ws.config_path, args.name)
+    commit = ws.commit([ws.config_path], f"council.toml: add {label} seat")
+    print(f"added the {label} seat to {ws.config_path}" + (f" (commit {commit})" if commit else ""))
+    spec = load_config(ws.config_path).get(args.name)
+    missing = [name for name in spec.env_refs() if not os.environ.get(name)]
+    if missing:
+        print(f"next: set {', '.join(missing)}, reopen the terminal, then run:")
+    else:
+        print("next: run")
+    print(f"  python -m council_engine doctor --ping --agents {args.name}")
     return EXIT_OK
 
 
@@ -349,6 +388,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("init", help="create the workspace, config and git repo")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("add-agent", help="add a ready-made seat to council.toml (e.g. glm)")
+    p.add_argument("name", choices=sorted(PRESETS), help="which ready-made seat")
+    p.set_defaults(func=cmd_add_agent)
 
     p = sub.add_parser("doctor", help="check each CLI is installed; --ping also tests logins")
     p.add_argument("--ping", action="store_true", help="send each agent a one-word test prompt")

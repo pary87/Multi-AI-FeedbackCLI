@@ -23,6 +23,8 @@ sys.path.insert(0, str(REPO))
 
 from council_engine import protocol  # noqa: E402
 from council_engine.agents import (  # noqa: E402
+    DEFAULT_CONFIG_TOML,
+    add_preset,
     check_batch_wrapper_args,
     clean_output,
     load_config,
@@ -342,6 +344,16 @@ class PingAndConfigTests(EngineTestCase):
         with self.assertRaises(CouncilError):
             check_batch_wrapper_args(["C:/npm/codex.cmd", "C:/Users/R&D/x.md"], is_windows=True)
 
+    def test_failure_reason_skips_harmless_notices(self) -> None:
+        from council_engine.runner import _failure_reason
+
+        noisy = (
+            '"glm-5.3" isn\'t described by this version\'s model catalog; update Claude Code\n'
+            '[claude-code:unrecognized_model] {"model":"glm-5.3"}\n'
+        )
+        self.assertEqual(_failure_reason(noisy), "")
+        self.assertEqual(_failure_reason(noisy + "API Error: 401 invalid key\n"), "API Error: 401 invalid key")
+
     def test_clean_output(self) -> None:
         self.assertEqual(clean_output("\x1b[32mhi\x1b[0m\r\nthere\r\n\r\n"), "hi\nthere\n")
         self.assertEqual(clean_output("   \n"), "")
@@ -422,6 +434,169 @@ class CliTests(EngineTestCase):
         self.run_cli("retry", "T-0001")
         out = self.run_cli("run", "T-0001", "--rounds", "2")
         self.assertIn("round 2 complete", out)
+
+
+SECRET = "s3cr3t-token-0123456789"
+
+
+def env_agents_toml() -> str:
+    py, fake = q(sys.executable), q(str(FAKE))
+    return f"""
+[agents.zed]
+label = "Zed"
+command = [{py}, {fake}, "--name", "zed", "--instruction", "{{instruction}}",
+           "--echo-env", "ZED_TOKEN", "--echo-env", "ZED_PROFILE", "--echo-env", "FAKE_MUST_VANISH"]
+unset_env = ["FAKE_MUST_VANISH"]
+
+[agents.zed.env]
+ZED_TOKEN = "Bearer ${{COUNCIL_TEST_SECRET}}"
+ZED_PROFILE = "{{home}}/.zed-profile"
+
+[agents.yon]
+label = "Yon"
+command = [{py}, {fake}, "--name", "yon", "--instruction", "{{instruction}}", "--echo-env", "ZED_TOKEN"]
+"""
+
+
+class EnvTests(EngineTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.home / "council.toml").write_text(fake_config(extra=env_agents_toml()), encoding="utf-8")
+        self.config = load_config(self.ws.config_path)
+
+    def set_secret(self) -> None:
+        os.environ["COUNCIL_TEST_SECRET"] = SECRET
+        self._env_keys.append("COUNCIL_TEST_SECRET")
+
+    def test_env_reaches_only_its_agent_and_secret_is_scrubbed(self) -> None:
+        self.set_secret()
+        os.environ["FAKE_MUST_VANISH"] = "an-anthropic-credential"
+        self._env_keys.append("FAKE_MUST_VANISH")
+        thread = self.ws.create_thread("env", "q?", ["zed", "yon"])
+        outcome = run_round(thread, self.config)
+        self.assertTrue(outcome.complete)
+        zed = parse_report(thread.response_path(1, "zed").read_text(encoding="utf-8"))
+        # The agent received the real value; what was saved has it scrubbed.
+        self.assertEqual(zed["env_ZED_TOKEN"], "Bearer [redacted]")
+        self.assertEqual(zed["env_ZED_PROFILE"], f"{Path.home()}/.zed-profile")
+        self.assertEqual(zed["env_FAKE_MUST_VANISH"], "<unset>")  # unset_env removed it
+        yon = parse_report(thread.response_path(1, "yon").read_text(encoding="utf-8"))
+        self.assertEqual(yon["env_ZED_TOKEN"], "<unset>")
+        for path in thread.path.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(SECRET, path.read_text(encoding="utf-8"), f"secret leaked into {path}")
+        self.assertNotIn(SECRET, self.ws.git("log", "-p").stdout)
+
+    def test_missing_env_variable_fails_only_that_agent(self) -> None:
+        os.environ.pop("COUNCIL_TEST_SECRET", None)
+        thread = self.ws.create_thread("env", "q?", ["zed", "yon"])
+        outcome = run_round(thread, self.config)
+        self.assertEqual(outcome.results["zed"].status, "error")
+        self.assertIn("COUNCIL_TEST_SECRET is not set", outcome.results["zed"].detail)
+        self.assertEqual(outcome.results["yon"].status, "ok")
+
+    def test_env_validation(self) -> None:
+        bad = {
+            "bad name": '[agents.a]\ncommand = ["x", "{instruction}"]\n[agents.a.env]\n"1BAD" = "v"\n',
+            "not a string": '[agents.a]\ncommand = ["x", "{instruction}"]\n[agents.a.env]\nA = 5\n',
+            "unknown placeholder": '[agents.a]\ncommand = ["x", "{instruction}"]\n[agents.a.env]\nA = "{nope}"\n',
+        }
+        for label, text in bad.items():
+            path = Path(self._tmp.name) / "bad.toml"
+            path.write_text(text, encoding="utf-8")
+            with self.assertRaises(CouncilError, msg=label):
+                load_config(path)
+
+    def test_glm_preset(self) -> None:
+        path = Path(self._tmp.name) / "c.toml"
+        path.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
+        self.assertEqual(add_preset(path, "glm"), "GLM")
+        spec = load_config(path).get("glm")
+        self.assertEqual(spec.env_refs(), ["ZAI_API_KEY"])
+        self.assertEqual(spec.env["ANTHROPIC_BASE_URL"], "https://api.z.ai/api/anthropic")
+        self.assertIn("glm-5.3", spec.command)
+        self.assertIn("Read,Glob,Grep", spec.command)  # same read-only tools as the Claude seat
+        self.assertTrue(spec.env["CLAUDE_CONFIG_DIR"].startswith("{home}"))  # never the main profile
+        # Anthropic credentials are stripped so they can never be sent to Z.ai.
+        self.assertEqual(sorted(spec.unset_env), ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])
+        with self.assertRaises(CouncilError):
+            add_preset(path, "glm")
+        with self.assertRaises(CouncilError):
+            add_preset(path, "nope")
+
+
+class SyncTests(EngineTestCase):
+    def add_remote(self, url: str) -> None:
+        self.ws.git("remote", "add", "origin", url)
+        self.ws.auto_push = True
+
+    def test_rounds_are_uploaded(self) -> None:
+        bare = Path(self._tmp.name) / "remote.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        self.add_remote(str(bare))
+        thread = self.new_thread()
+        events: list[dict] = []
+        run_round(thread, self.config, on_event=events.append)
+        self.assertEqual(events[-1]["push"], "pushed")
+        remote_log = subprocess.run(
+            ["git", "--git-dir", str(bare), "log", "--all", "--format=%s"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertIn("T-0001 round 1: claude ok, chatgpt ok, kimi ok", remote_log)
+        self.assertIn('T-0001: new thread "LDO selection"', remote_log)
+
+    def test_failed_upload_never_fails_the_run(self) -> None:
+        self.add_remote(str(Path(self._tmp.name) / "does-not-exist.git"))
+        thread = self.new_thread()
+        events: list[dict] = []
+        outcome = run_round(thread, self.config, on_event=events.append)
+        self.assertTrue(outcome.complete)
+        self.assertTrue(events[-1]["push"].startswith("failed"))
+        self.assertEqual(self.git_log()[0], "T-0001 round 1: claude ok, chatgpt ok, kimi ok")
+
+    def test_no_remote_means_no_upload(self) -> None:
+        self.ws.auto_push = True
+        thread = self.new_thread()
+        events: list[dict] = []
+        run_round(thread, self.config, on_event=events.append)
+        self.assertEqual(events[-1]["push"], "no remote")
+
+    def test_auto_push_setting(self) -> None:
+        self.assertTrue(self.config.auto_push)
+        path = Path(self._tmp.name) / "off.toml"
+        path.write_text(fake_config().replace("timeout_minutes = 1", "timeout_minutes = 1\nauto_push = false"),
+                        encoding="utf-8")
+        self.assertFalse(load_config(path).auto_push)
+
+
+class CliAdditionsTests(EngineTestCase):
+    def run_cli(self, *args: str, expect: int = 0) -> str:
+        proc = subprocess.run(
+            [sys.executable, "-m", "council_engine", "--home", str(self.home), *args],
+            cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+        )
+        self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+        return proc.stdout + proc.stderr
+
+    def test_add_agent_and_doctor_env_check(self) -> None:
+        out = self.run_cli("add-agent", "glm")
+        self.assertIn("added the GLM seat", out)
+        self.assertIn("council.toml: add GLM seat", self.git_log()[0])
+        self.run_cli("add-agent", "glm", expect=2)  # already there
+        (self.home / "council.toml").write_text(fake_config(extra=env_agents_toml()), encoding="utf-8")
+        os.environ.pop("COUNCIL_TEST_SECRET", None)
+        out = self.run_cli("doctor", "--agents", "zed", expect=1)
+        self.assertIn("MISSING environment variable: COUNCIL_TEST_SECRET", out)
+        self.assertNotIn(SECRET, out)
+
+    def test_cli_reports_upload(self) -> None:
+        bare = Path(self._tmp.name) / "remote.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        self.ws.git("remote", "add", "origin", str(bare))
+        out = self.run_cli("ask", "t", "-q", "q?", "--rounds", "1")
+        self.assertIn("and uploaded to GitHub", out)
+        out = self.run_cli("doctor")
+        self.assertIn(f"sync: uploads to {bare}", out)
 
 
 if __name__ == "__main__":

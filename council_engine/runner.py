@@ -37,7 +37,9 @@ from .agents import (
     child_env,
     clean_output,
     probe_version,
+    redact,
     render_command,
+    resolve_env,
     resolve_executable,
 )
 from .store import (
@@ -125,13 +127,18 @@ class _ProcessRegistry:
             _kill_tree(proc)
 
 
-def _popen(argv: list[str], cwd: Path) -> subprocess.Popen:
+def _popen(
+    argv: list[str],
+    cwd: Path,
+    extra_env: dict[str, str] | None = None,
+    unset_env: list[str] | None = None,
+) -> subprocess.Popen:
     kwargs: dict = dict(
         cwd=str(cwd),
         stdin=subprocess.DEVNULL,  # Codex appends piped stdin to the prompt; give it nothing
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=child_env(),
+        env=child_env(extra_env, unset_env),
     )
     # Own process group, so a timeout or Ctrl+C can kill the whole tree (the CLI
     # plus any node/shell processes it spawned), not just the top wrapper.
@@ -172,12 +179,19 @@ def _snapshot(folder: Path) -> dict[str, str]:
 
 
 _ERROR_LINE_RE = re.compile(r"error|fail|denied|login|log in|unauthori[sz]ed|quota|limit", re.I)
+# Harmless notices that must never be reported as the reason a run failed.
+_NOISE_LINE_RE = re.compile(
+    r"isn't described by this version's model catalog|\[claude-code:unrecognized_model\]"
+)
 
 
 def _failure_reason(text: str) -> str:
     """The most informative line of an error stream: the last one that looks like
     an error, else the last line. (Kimi, for one, ends with a 'See log:' line.)"""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = [
+        line.strip() for line in text.splitlines()
+        if line.strip() and not _NOISE_LINE_RE.search(line)
+    ]
     if not lines:
         return ""
     errorish = [line for line in lines if _ERROR_LINE_RE.search(line)]
@@ -225,12 +239,13 @@ def _run_one(
         )
         argv = resolve_executable(argv, spec)
         check_batch_wrapper_args(argv)
+        extra_env, secrets = resolve_env(spec, council_dir)
         result.version = probe_version(spec)
         if cancel.is_set():
             result.status = "cancelled"
             return result
 
-        proc = _popen(argv, view)
+        proc = _popen(argv, view, extra_env, spec.unset_env)
         registry.add(proc)
         if cancel.is_set():  # Ctrl+C landed between the check above and registration
             _kill_tree(proc)
@@ -248,12 +263,13 @@ def _run_one(
             registry.discard(proc)
 
         result.exit_code = proc.returncode
-        result.stderr = stderr.decode("utf-8", errors="replace")
+        # Secrets passed via ${...} never reach a saved reply, log or event.
+        result.stderr = redact(stderr.decode("utf-8", errors="replace"), secrets)
         if spec.capture == "file":
             raw = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
         else:
             raw = stdout.decode("utf-8", errors="replace")
-        text = clean_output(raw, spec.strip_regex)
+        text = clean_output(redact(raw, secrets), spec.strip_regex)
 
         after = _snapshot(view)
         changed = sorted(set(before.items()) ^ set(after.items()))
@@ -272,7 +288,9 @@ def _run_one(
         elif proc.returncode != 0:
             result.status = "failed"
             reason = _failure_reason(clean_output(result.stderr)) or _failure_reason(text)
-            result.detail = f"exit code {proc.returncode}" + (f": {reason}" if reason else "")
+            result.detail = f"exit code {proc.returncode}: " + (
+                reason or "no error message (check the network and this agent's login)"
+            )
         elif not text:
             result.status, result.detail = "failed", "exited normally but replied with nothing"
         else:
@@ -514,7 +532,8 @@ def run_round(
     outcome = RunOutcome(
         "round", round_no, results, commit=commit, complete=thread.round_complete(round_no)
     )
-    on_event({"type": "run_finished", "commit": commit, "complete": outcome.complete, **context})
+    on_event({"type": "run_finished", "commit": commit, "complete": outcome.complete,
+              "push": thread.workspace.last_push if commit else None, **context})
     return outcome
 
 
@@ -582,7 +601,8 @@ def run_synthesis(
         [thread.path], f"{thread.id} synthesis by {by}: {result.status}"
     )
     outcome = RunOutcome("synthesis", None, {by: result}, commit=commit, complete=result.ok)
-    on_event({"type": "run_finished", "commit": commit, "complete": result.ok, **context})
+    on_event({"type": "run_finished", "commit": commit, "complete": result.ok,
+              "push": thread.workspace.last_push if commit else None, **context})
     return outcome
 
 
