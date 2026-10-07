@@ -258,7 +258,11 @@ class PagesImportTests(unittest.TestCase):
     def test_pages_module_loads(self) -> None:
         from council_app import server
 
+        import inspect
+
         self.assertTrue(callable(server.build) and callable(server.serve))
+        self.assertIn("native", inspect.signature(server.serve).parameters)
+        self.assertTrue(server.ICON_PATH.is_file())
 
 
 class AppStateTests(unittest.TestCase):
@@ -276,6 +280,66 @@ class AppStateTests(unittest.TestCase):
             a.record_test({"claude": {"status": "ok"}})
             self.assertEqual(json.loads(path.read_text())["workspaces"][str(Path(tmp) / "a")]
                              ["last_test"]["results"]["claude"]["status"], "ok")
+
+
+class LauncherTests(unittest.TestCase):
+    """The own-window launcher: no console, pop-up messages, shortcuts, the icon."""
+
+    def test_helper_process_never_starts_a_second_server(self) -> None:
+        import runpy
+        from unittest import mock
+
+        import warnings
+
+        with mock.patch("council_app.__main__.main") as fake_main, warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # runpy notes the module is already loaded
+            # The window's helper process may import this module under another name.
+            runpy.run_module("council_app.__main__", run_name="__mp_main__")
+        fake_main.assert_not_called()
+
+    def test_output_goes_to_a_log_without_a_console(self) -> None:
+        import sys
+        import tempfile
+
+        from council_app import __main__ as launcher
+
+        saved = sys.stdout, sys.stderr
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "logs" / "council.log"
+            try:
+                launcher.send_output_to_log(log)
+                print("hello from the app")
+                sys.stdout.flush()
+            finally:
+                sys.stdout.close()
+                sys.stdout, sys.stderr = saved
+            self.assertIn("hello from the app", log.read_text(encoding="utf-8"))
+        self.assertTrue(launcher.has_console())
+
+    def test_shortcuts_point_at_windowless_python(self) -> None:
+        import tempfile
+
+        from council_app import shortcuts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            python = Path(tmp) / "python.exe"
+            python.write_text("")
+            self.assertEqual(shortcuts.windowless_python(str(python)), python)  # no pythonw: fall back
+            (Path(tmp) / "pythonw.exe").write_text("")
+            self.assertEqual(shortcuts.windowless_python(str(python)), Path(tmp) / "pythonw.exe")
+            env = shortcuts.shortcut_env(str(python))
+        self.assertTrue(env["COUNCIL_LNK_TARGET"].endswith("pythonw.exe"))
+        self.assertEqual(Path(env["COUNCIL_LNK_DIR"]), Path(__file__).resolve().parent.parent)
+        self.assertTrue(Path(env["COUNCIL_LNK_ICON"]).is_file())
+        if os.name != "nt":
+            with self.assertRaises(RuntimeError):
+                shortcuts.install_shortcuts()
+
+    def test_icon_is_a_real_windows_icon(self) -> None:
+        icon = Path(__file__).resolve().parent.parent / "council_app" / "assets" / "council.ico"
+        data = icon.read_bytes()
+        self.assertEqual(data[:4], b"\x00\x00\x01\x00")  # ICO header
+        self.assertGreaterEqual(int.from_bytes(data[4:6], "little"), 4)  # several sizes
 
 
 if __name__ == "__main__":

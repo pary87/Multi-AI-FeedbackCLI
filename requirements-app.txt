@@ -1,2 +1,4 @@
-# Only the app needs this; the terminal commands use the Python standard library alone.
+# Only the app needs these; the terminal commands use the Python standard library alone.
 nicegui>=3.18,<4
+# Council's own window on Windows (uses the Edge engine built into Windows 10/11).
+pywebview>=6.2; sys_platform == "win32"

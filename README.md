@@ -156,26 +156,37 @@ Each vendor's model is reached only through that vendor's official CLI with its 
 
 ## The Council app
 
-The app is a local web page served by Python on this computer only (`http://127.0.0.1:8090`). Nothing outside the computer can reach it, and it refuses requests that carry another website's address, so a page you visit cannot drive it either. It uses the same engine as the terminal, so threads made in either place are the same folders.
+Council opens in its own window with its own icon, like any desktop app: no browser tab and no black console window. The window is drawn by Microsoft Edge WebView2, the web engine built into Windows 10 and 11 (the same approach VS Code and Slack use). Behind it, Python serves the pages on this computer only (`http://127.0.0.1:8090`). Nothing outside the computer can reach it, and it refuses requests that carry another website's address, so a page you visit in your browser cannot drive it either. It uses the same engine as the terminal, so threads made in either place are the same folders.
 
-**One-time install** (from the repo folder):
+**One-time setup** (in PowerShell, in the repo folder):
 ```
 python -m pip install -r requirements-app.txt
+python -m council_app --install-shortcuts
 ```
+The second command puts a **Council** shortcut on the desktop and in the Start menu. Each shortcut runs `pythonw.exe -m council_app` in this folder, so `git pull` updates the app and the shortcuts never need to be made again. To pin it, right-click Council in the Start menu and choose Pin to taskbar.
 
-**Start it:** double-click `Council.bat` in the repo folder. A black window opens (keep it open) and the app opens in your browser. Closing the black window quits the app and stops any run in progress. Double-clicking again while it runs just opens the browser tab. From a terminal: `python -m council_app` (options: `--home FOLDER`, `--port 8090`, `--no-browser`).
+**Using it:**
+- **Open:** double-click Council. The window opens maximized. Opening it again while it runs shows "Council is already open".
+- **Close:** close the window. It first asks you to confirm, because closing the window also stops any run in progress (finished rounds stay saved, and Continue on the thread picks up from there).
+- **Read and copy:** text can be selected and copied, and Ctrl + / Ctrl - zoom.
+- **Log:** without a console, messages go to a pop-up and the log goes to `%USERPROFILE%\.council-app\council.log`.
+
+Other ways to start it:
+- `Council.bat` opens the same window plus a console that shows the log, which is handy for troubleshooting.
+- `python -m council_app --browser` uses a browser tab instead of the window.
+- The other options are `--home FOLDER` and `--port 8090`.
 
 | Screen | What it does |
 |---|---|
 | Threads | Every thread, newest first, with status, rounds and synthesis. Click one to open it. |
 | New question | Title, question (or load a `.md` file), attachments, who takes part with a model level for this question only, the client-data switch, rounds (1 to 3) and who writes the synthesis. |
-| Live run | One card per agent with a live timer, the steps (rounds, then synthesis), an activity log, and **Stop run**. Stop closes every agent at once; nothing from the unfinished step is saved, and finished rounds stay saved. You can close the browser tab; the run continues while the black window is open. |
+| Live run | One card per agent with a live timer, the steps (rounds, then synthesis), an activity log, and **Stop run**. Stop closes every agent at once; nothing from the unfinished step is saved, and finished rounds stay saved. In browser-tab mode you can close the tab; the run continues while the app is running. |
 | Thread | The question, the synthesis (switch between writers when there are several), every round's answers, and the audit trail of commits. Buttons: Continue (finish a stopped or interrupted plan), One more round, Synthesize with, Retry failed, Open folder. |
 | Settings | Model levels per seat, the time limit, Test connections, which seats may see client data, GitHub sync (Upload now, upload after every round) and the workspace folder. Save writes `council.toml`, keeping its comments, and commits it. |
 
 Agent replies are shown as formatted Markdown with any HTML in them neutralised, so a reply cannot run code in the page. Kimi's terminal-style list formatting is removed so its headings and tables render properly.
 
-How it fits together: `council_engine/runner.py` reports progress through an `on_event` callback and takes a `stop` event; `council_app/jobs.py` runs one job at a time on a worker thread and keeps the live state the pages poll; `council_app/server.py` holds the five pages (NiceGUI); `council_engine/config_edit.py` changes `council.toml` in place.
+How it fits together: `council_engine/runner.py` reports progress through an `on_event` callback and takes a `stop` event; `council_app/jobs.py` runs one job at a time on a worker thread and keeps the live state the pages poll; `council_app/server.py` holds the five pages (NiceGUI, whose native mode hosts them in a pywebview window); `council_app/shortcuts.py` makes the Windows shortcuts; `council_engine/config_edit.py` changes `council.toml` in place.
 
 ## Tests
 
@@ -183,7 +194,7 @@ How it fits together: `council_engine/runner.py` reports progress through an `on
 python -m unittest discover -s tests -v
 ```
 
-There are 62 tests (`tests/test_engine.py` and `tests/test_app.py`). They use `tests/fake_agent.py` in place of the real CLIs. It reports exactly what it was shown, which lets the tests prove:
+There are 66 tests (`tests/test_engine.py` and `tests/test_app.py`). They use `tests/fake_agent.py` in place of the real CLIs. It reports exactly what it was shown, which lets the tests prove:
 
 - round-1 blindness;
 - the round-2 transcript;
@@ -203,6 +214,7 @@ There are 62 tests (`tests/test_engine.py` and `tests/test_app.py`). They use `t
 - editing `council.toml` (levels, client data, time limit, upload) without losing comments, and per-question levels that leave the file alone;
 - the app's run manager: full runs, one run at a time, failed seats and retries, connection tests;
 - that the app only answers this computer's own browser;
+- the launcher: the window's helper process never starts a second server, output goes to a log without a console, shortcuts point at the windowless Python;
 - the full CLI flow.
 
-The pages themselves were checked by clicking through every screen in a real browser against stand-in agents.
+The pages themselves were checked by clicking through every screen in a real browser against stand-in agents. The own-window mode was checked by opening the app in a pywebview window, reading what it showed, and closing it, which shut the app down cleanly.

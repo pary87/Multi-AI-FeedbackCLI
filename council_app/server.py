@@ -41,7 +41,6 @@ LOGO_SVG = (
     '<circle cx="6.5" cy="20" r="3.5"/><circle cx="21.5" cy="20" r="3.5"/>'
     '<path d="M12.3 10.1l-4 6.8M15.7 10.1l4 6.8M10 20h8"/></svg>'
 )
-FAVICON_SVG = LOGO_SVG.replace("#E8EAE7", "#1B4F8A").replace('width="30" height="30" ', "")
 
 CSS = r"""
 :root { --ink:#15181B; --muted:#4A5058; --line:#D5D9D4; --soft:#E3E6E2; --bg:#EDEFEC; --brand:#1B4F8A; }
@@ -1395,21 +1394,42 @@ def build(ctx: Context) -> None:
                 ui.button("Save settings", icon="save", on_click=save)
 
 
-def serve(root: Path, *, port: int = 8090, show: bool = True, state_path: Path | None = None) -> None:
+ICON_PATH = Path(__file__).resolve().parent / "assets" / "council.ico"
+
+
+def serve(root: Path, *, port: int = 8090, show: bool = True, native: bool = False,
+          state_path: Path | None = None) -> None:
+    """Start Council. native=True opens its own window (pywebview); otherwise a browser tab."""
     ctx = Context(root, state_path)
     build(ctx)
     app.add_middleware(LocalOnly, port=port)
     app.on_shutdown(ctx.jobs.shutdown)
     url = f"http://127.0.0.1:{port}/"
-    print(f"Council is running at {url}")
-    print("Keep this window open while you use it. Close it (or press Ctrl+C) to quit;")
-    print("that also stops any run in progress.")
+    if native:
+        app.native.window_args.update(
+            maximized=True,
+            min_size=(900, 600),
+            text_select=True,    # replies can be selected and copied
+            zoomable=True,       # Ctrl + and Ctrl - work, as in a browser
+            confirm_close=True,  # closing the window stops a run, so ask first
+            background_color="#EDEFEC",
+        )
+        app.native.start_args["localization"] = {
+            "global.quitConfirmation": "Close Council? A run in progress stops; finished rounds stay saved.",
+        }
+        print(f"Council is open in its own window (served at {url}).")
+    else:
+        print(f"Council is running at {url}")
+        print("Keep this window open while you use it. Close it (or press Ctrl+C) to quit;")
+        print("that also stops any run in progress.")
     ui.run(
         host="127.0.0.1",
         port=port,
         title="Council",
-        favicon=FAVICON_SVG,
+        favicon=ICON_PATH,
         reload=False,
-        show="/" if show else False,
+        native=native,
+        window_size=(1360, 880) if native else None,
+        show=("/" if show else False) if not native else False,
         show_welcome_message=False,
     )
